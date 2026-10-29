@@ -1,0 +1,161 @@
+{
+  "requests": [
+    {
+      "name": "binary-get",
+      "op": 1,
+      "flags": 0,
+      "key_hex": "00ff",
+      "value_hex": "",
+      "ttl_ms": "18446744073709551615",
+      "frame_hex": "534b5631010000000200000000000000ffffffffffffffff00ff"
+    },
+    {
+      "name": "empty-put",
+      "op": 2,
+      "flags": 1,
+      "key_hex": "656d707479",
+      "value_hex": "",
+      "ttl_ms": "18446744073709551615",
+      "frame_hex": "534b5631020100000500000000000000ffffffffffffffff656d707479"
+    },
+    {
+      "name": "zero-ttl",
+      "op": 2,
+      "flags": 6,
+      "key_hex": "657870697265",
+      "value_hex": "76",
+      "ttl_ms": "0",
+      "frame_hex": "534b5631020600000600000001000000000000000000000065787069726576"
+    },
+    {
+      "name": "delete",
+      "op": 3,
+      "flags": 0,
+      "key_hex": "6772656574696e67",
+      "value_hex": "",
+      "ttl_ms": "18446744073709551615",
+      "frame_hex": "534b5631030000000800000000000000ffffffffffffffff6772656574696e67"
+    }
+  ],
+  "row_hex": "070009005f5f70726f746f5f5f020400000073616665060061637469766505010000000105006279746573010200000000ff03006d61780308000000ffffffffffffff7f03006d696e030800000000000000000000800500726174696f0408000000000000000000f43f040074657874020600000068c3a96c6c6f",
+  "row_key_hex": "0500757365727300ff",
+  "row_crc32": 1948874924,
+  "raw_crc32": 1826356594,
+  "database": {
+    "name": "tenant",
+    "key_hex": "00ff",
+    "wire_key_hex": "060074656e616e7400ff",
+    "crc32": 749698047,
+    "get_frame_hex": "534b5631010800000a00000000000000ffffffffffffffff060074656e616e7400ff"
+  },
+  "batch": {
+    "requests": [
+      {
+        "name": "default-database",
+        "database": "",
+        "keys_hex": [
+          "00ff",
+          "6b"
+        ],
+        "frame_hex": "534b5631090000000f00000000000000ffffffffffffffff020000000200000000ff010000006b"
+      },
+      {
+        "name": "named-database",
+        "database": "tenant",
+        "keys_hex": [
+          "00ff",
+          "6b"
+        ],
+        "frame_hex": "534b5631090800001700000000000000ffffffffffffffff060074656e616e74020000000200000000ff010000006b"
+      }
+    ],
+    "response": {
+      "body_hex": "05000000000200000076310100000000000000000002000000000700000000",
+      "entries": [
+        {
+          "status": 0,
+          "value_hex": "7631"
+        },
+        {
+          "status": 1,
+          "value_hex": ""
+        },
+        {
+          "status": 0,
+          "value_hex": ""
+        },
+        {
+          "status": 2,
+          "value_hex": ""
+        },
+        {
+          "status": 7,
+          "value_hex": ""
+        }
+      ]
+    }
+  },
+  "versions": {
+    "requests": [
+      {
+        "name": "get-versioned",
+        "op": 1,
+        "flags": 16,
+        "key_hex": "00ff",
+        "expected": null,
+        "value_hex": "",
+        "frame_hex": "534b5631011000000200000000000000ffffffffffffffff00ff"
+      },
+      {
+        "name": "put-if",
+        "op": 2,
+        "flags": 48,
+        "key_hex": "6b",
+        "expected": "458755",
+        "value_hex": "76",
+        "frame_hex": "534b5631023000000100000009000000ffffffffffffffff6b030007000000000076"
+      },
+      {
+        "name": "put-if-absent",
+        "op": 2,
+        "flags": 48,
+        "key_hex": "6b",
+        "expected": "0",
+        "value_hex": "76",
+        "frame_hex": "534b5631023000000100000009000000ffffffffffffffff6b000000000000000076"
+      },
+      {
+        "name": "delete-if",
+        "op": 3,
+        "flags": 48,
+        "key_hex": "6b",
+        "expected": "458755",
+        "value_hex": "",
+        "frame_hex": "534b5631033000000100000008000000ffffffffffffffff6b0300070000000000"
+      }
+    ],
+    "responses": [
+      {
+        "name": "get-versioned",
+        "status": 0,
+        "body_hex": "030007000000000076616c7565",
+        "version": "458755",
+        "value_hex": "76616c7565"
+      },
+      {
+        "name": "put-if",
+        "status": 0,
+        "body_hex": "0400070000000000",
+        "version": "458756",
+        "value_hex": ""
+      },
+      {
+        "name": "conflict",
+        "status": 10,
+        "body_hex": "",
+        "version": null,
+        "value_hex": ""
+      }
+    ]
+  }
+}
