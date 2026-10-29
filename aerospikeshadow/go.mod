@@ -5,7 +5,7 @@ go 1.23.0
 require (
 	github.com/aerospike/aerospike-client-go v4.5.2+incompatible
 	github.com/aerospike/aerospike-client-go/v8 v8.5.0
-	github.com/m6yf/smkv-go v0.1.0
+	github.com/m6yf/smkv-go v0.1.1
 )
 
 require (
