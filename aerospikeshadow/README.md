@@ -36,8 +36,16 @@ scans included, goes to Aerospike alone.
 - With Aerospike's meaning: `UPDATE` (the default) sets the bins written and
   creates a missing row; `REPLACE`, `REPLACE_ONLY` and `CREATE_ONLY` replace the
   row; a nil bin removes its column.
-- In the order Aerospike accepted them, per key: a key's copies always take the
-  same lane.
+- In the order the calls returned, per key: a key's copies always take the
+  same lane. Calls that write one key at the same time can return in another
+  order than Aerospike applied them. When the last of them returns, the
+  record is copied whole from Aerospike (`repair`), so SMKV ends with what
+  Aerospike holds. That costs one Aerospike read, only for keys written
+  concurrently by one process. Concurrent writes from different processes
+  are not seen; a later read compare reports them.
+- Again, if SMKV refused a copy before applying it (`Busy`, as during an
+  ownership change): within `Config.Timeout`, holding the key's lane, so
+  order is kept (`refused`).
 - Addressed as SMKV's migration tool converts an Aerospike export, so a shadow
   can start from a bulk load: the namespace is the SMKV database in
   `Config.Options`, a set is the table of the same name (records without a set
@@ -57,15 +65,18 @@ or other bin SMKV has no column for is not copied, and counted `unsupported`.
   background.
 - While `Config.OffFile` exists, nothing is sent; it is checked every second.
 - Memory is bounded by `Lanes × Queue` queued writes.
+- Each write takes its lane's lock twice, to count the calls writing its key.
 
 ## Reads
 
 A sampled read is compared after the copies queued before it. A mismatch gets a
-second look after `Config.Recheck` (2 s), so a copy still in flight is counted
-`converged`, not as a mismatch. Only the bins the read named are compared.
+second look after `Config.Recheck` (2 s). The second look reads Aerospike
+again as well as SMKV, so neither a copy still in flight nor a newer write is
+counted as a mismatch: it counts `converged`. Only the bins the read named
+are compared.
 
 `Config.Count` receives one event per copy and comparison: `merge`, `replace`,
-`delete` (and their `_error` and `_invalid` forms), `match`, `converged`,
+`delete`, `repair` (and their `_error` and `_invalid` forms), `refused`, `match`, `converged`,
 `mismatch_missing`, `mismatch_extra`, `mismatch_value`, `compare_error`,
 `dropped`, `paused`, `not_connected`, `no_user_key`, `unsupported` and
 `other_namespace`. At most one mismatch every 10 s is logged, with its key

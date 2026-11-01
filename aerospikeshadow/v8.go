@@ -19,6 +19,7 @@ func WrapV8(client *as.Client, shadow *Shadow) *ClientV8 {
 }
 
 func (c *ClientV8) Put(policy *as.WritePolicy, key *as.Key, bins as.BinMap) as.Error {
+	p := c.shadow.begin(key.Namespace(), key.SetName(), key.Value())
 	err := c.Client.Put(policy, key, bins)
 	if err == nil && c.shadow != nil {
 		written := make([]bin, 0, len(bins))
@@ -27,10 +28,14 @@ func (c *ClientV8) Put(policy *as.WritePolicy, key *as.Key, bins as.BinMap) as.E
 		}
 		c.shadow.write(key.Namespace(), key.SetName(), key.Value(), replacesV8(policy), written)
 	}
+	if c.shadow.end(p) {
+		c.shadow.repair(p, c.reread(key))
+	}
 	return err
 }
 
 func (c *ClientV8) PutBins(policy *as.WritePolicy, key *as.Key, bins ...*as.Bin) as.Error {
+	p := c.shadow.begin(key.Namespace(), key.SetName(), key.Value())
 	err := c.Client.PutBins(policy, key, bins...)
 	if err == nil && c.shadow != nil {
 		written := make([]bin, len(bins))
@@ -39,13 +44,20 @@ func (c *ClientV8) PutBins(policy *as.WritePolicy, key *as.Key, bins ...*as.Bin)
 		}
 		c.shadow.write(key.Namespace(), key.SetName(), key.Value(), replacesV8(policy), written)
 	}
+	if c.shadow.end(p) {
+		c.shadow.repair(p, c.reread(key))
+	}
 	return err
 }
 
 func (c *ClientV8) Delete(policy *as.WritePolicy, key *as.Key) (bool, as.Error) {
+	p := c.shadow.begin(key.Namespace(), key.SetName(), key.Value())
 	existed, err := c.Client.Delete(policy, key)
 	if err == nil {
 		c.shadow.remove(key.Namespace(), key.SetName(), key.Value())
+	}
+	if c.shadow.end(p) {
+		c.shadow.repair(p, c.reread(key))
 	}
 	return existed, err
 }
@@ -55,9 +67,9 @@ func (c *ClientV8) Get(policy *as.BasePolicy, key *as.Key, binNames ...string) (
 	if c.shadow.sampled() {
 		switch {
 		case err == nil && record != nil:
-			c.shadow.compare(key.Namespace(), key.SetName(), key.Value(), binNames, record.Bins, true)
+			c.shadow.compare(key.Namespace(), key.SetName(), key.Value(), binNames, record.Bins, true, c.reread(key, binNames...))
 		case err != nil && err.Matches(types.KEY_NOT_FOUND_ERROR):
-			c.shadow.compare(key.Namespace(), key.SetName(), key.Value(), binNames, nil, false)
+			c.shadow.compare(key.Namespace(), key.SetName(), key.Value(), binNames, nil, false, c.reread(key, binNames...))
 		}
 	}
 	return record, err
@@ -68,13 +80,27 @@ func (c *ClientV8) BatchGet(policy *as.BatchPolicy, keys []*as.Key, binNames ...
 	if err == nil && len(records) == len(keys) && c.shadow.sampled() {
 		for i, key := range keys {
 			if records[i] == nil {
-				c.shadow.compare(key.Namespace(), key.SetName(), key.Value(), binNames, nil, false)
+				c.shadow.compare(key.Namespace(), key.SetName(), key.Value(), binNames, nil, false, c.reread(key, binNames...))
 			} else {
-				c.shadow.compare(key.Namespace(), key.SetName(), key.Value(), binNames, records[i].Bins, true)
+				c.shadow.compare(key.Namespace(), key.SetName(), key.Value(), binNames, records[i].Bins, true, c.reread(key, binNames...))
 			}
 		}
 	}
 	return records, err
+}
+
+// reread reads key's binNames, every bin if none, from Aerospike alone.
+func (c *ClientV8) reread(key *as.Key, binNames ...string) reread {
+	return func() (map[string]interface{}, bool, error) {
+		record, err := c.Client.Get(nil, key, binNames...)
+		switch {
+		case err != nil && err.Matches(types.KEY_NOT_FOUND_ERROR):
+			return nil, false, nil
+		case err != nil:
+			return nil, false, err
+		}
+		return record.Bins, true, nil
+	}
 }
 
 // replacesV8 reports whether a write under policy leaves the record holding

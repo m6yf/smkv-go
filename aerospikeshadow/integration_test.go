@@ -12,10 +12,12 @@ package aerospikeshadow
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -242,6 +244,64 @@ func TestV8AgainstAerospikeAndSMKV(t *testing.T) {
 	same(key)
 
 	eventually(t, "the comparisons", func() bool { return n.get("match") >= 3 })
+	cleanCounters(t, n)
+}
+
+// Calls writing one key at once return in any order, so their copies can
+// reach SMKV in another order than Aerospike applied them; the record is then
+// copied whole once the last call ends.
+func TestConcurrentWritesOfOneKeyConverge(t *testing.T) {
+	c := clusterFromEnv(t)
+	s, n := c.shadow(t)
+	raw4, err := as.NewClientWithPolicyAndHost(as.NewClientPolicy(), as.NewHost(c.host, c.port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw4.Close()
+	raw8, err8 := as8.NewClientWithPolicyAndHost(as8.NewClientPolicy(), as8.NewHost(c.host, c.port))
+	if err8 != nil {
+		t.Fatal(err8)
+	}
+	defer raw8.Close()
+	v4, v8 := WrapV4(raw4, s), WrapV8(raw8, s)
+	key4, _ := as.NewKey(c.namespace, "lookup", c.prefix+"c1")
+	key8, _ := as8.NewKey(c.namespace, "lookup", c.prefix+"c1")
+	for round := 0; round < 50; round++ {
+		var wg sync.WaitGroup
+		for w := 0; w < 8; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				value := fmt.Sprintf("%d-%d", round, w)
+				if w%2 == 0 {
+					if err := v4.PutBins(nil, key4, as.NewBin("payload", value)); err != nil {
+						t.Error(err)
+					}
+				} else if err := v8.PutBins(nil, key8, as8.NewBin("payload", value)); err != nil {
+					t.Error(err)
+				}
+			}()
+		}
+		wg.Wait()
+	}
+	// Every copy applied, so the repairs no longer race them.
+	for deadline := time.Now().Add(30 * time.Second); n.get("merge") < 50*8; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("copies still queued: %v", n.n)
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	table, rowKey, _ := s.row(key8.Namespace(), key8.SetName(), key8.Value())
+	c.sameRow(t, table, rowKey, func() (map[string]interface{}, bool) {
+		record, err := raw8.Get(nil, key8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return record.Bins, true
+	})
+	if n.get("repair") == 0 {
+		t.Fatalf("no write was ever concurrent: %v", n.n)
+	}
 	cleanCounters(t, n)
 }
 

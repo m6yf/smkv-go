@@ -20,11 +20,18 @@
 // Config.Count receives an event name for each copy and comparison:
 //
 //   - merge, replace, delete: a copy SMKV applied; with _error, one it failed,
-//     and with _invalid, one past its limits.
+//     and with _invalid, one past its limits. refused: SMKV refused a copy
+//     before applying it (Busy), and the copy goes again within its Timeout.
+//   - repair: a record copied whole from Aerospike, after calls that wrote its
+//     key at the same time ended; their copies may have reached SMKV in
+//     another order than Aerospike applied them. repair_error: Aerospike or
+//     SMKV failed it.
 //   - match: a sampled read SMKV agreed with. converged: one it agreed with on
-//     the second look, after its copy arrived. mismatch_missing (no row),
+//     the second look, which reads Aerospike again too, after its copy
+//     arrived. mismatch_missing (no row),
 //     mismatch_extra (a row Aerospike did not have), mismatch_value: one it
-//     still disagreed with. compare_error: SMKV could not be read.
+//     still disagreed with. compare_error: SMKV, or on the second look
+//     Aerospike, could not be read.
 //   - dropped (the queue was full), not_connected, paused (after repeated
 //     failures), no_user_key (a key without its value, from a scan of records
 //     stored without keys), unsupported (a list, map or other bin SMKV has no
@@ -99,9 +106,13 @@ const (
 	opReplace           // the record becomes these bins
 	opDelete
 	opCompare
+	opRepair // the record as Aerospike now holds it
 )
 
-var opNames = [...]string{"merge", "replace", "delete", "compare"}
+var opNames = [...]string{"merge", "replace", "delete", "compare", "repair"}
+
+// reread reads a record from Aerospike again: its bins, or found false.
+type reread func() (bins map[string]interface{}, found bool, err error)
 
 type job struct {
 	op      op
@@ -112,6 +123,7 @@ type job struct {
 	found   bool         // compare: Aerospike had the record
 	project []string     // compare: the bins read, all if empty
 	recheck bool         // compare: the second look after a mismatch
+	reread  reread       // compare: the read, again; repair: the whole record
 }
 
 type bin struct {
@@ -161,6 +173,26 @@ type Shadow struct {
 	failures  atomic.Int64
 	pausedTo  atomic.Int64 // unix nanoseconds
 	loggedAt  atomic.Int64 // the last mismatch logged, unix nanoseconds
+	writing   []writing    // per lane
+}
+
+// writing counts the calls writing each key of a lane.
+type writing struct {
+	mu   sync.Mutex
+	keys map[string]*calls
+}
+
+type calls struct {
+	n         int
+	contended bool // two were in Aerospike at once
+}
+
+// pending is one call's write of a row, from begin to end.
+type pending struct {
+	table string
+	key   []byte
+	lane  int
+	id    string
 }
 
 // New starts a shadow. It connects to SMKV in the background, retrying until
@@ -206,7 +238,8 @@ func newShadow(config Config) *Shadow {
 	if config.Recheck <= 0 {
 		config.Recheck = 2 * time.Second
 	}
-	s := &Shadow{config: config, log: config.Logger, lanes: make([]chan job, config.Lanes), done: make(chan struct{})}
+	s := &Shadow{config: config, log: config.Logger, lanes: make([]chan job, config.Lanes), done: make(chan struct{}),
+		writing: make([]writing, config.Lanes)}
 	if s.log == nil {
 		s.log = slog.Default()
 	}
@@ -301,6 +334,57 @@ func (s *Shadow) sampled() bool {
 	return s != nil && s.connected.Load() && !s.off.Load() && rand.Float64() < s.config.ReadSample
 }
 
+// begin records a call writing a key, before it goes to Aerospike. Calls
+// that write one key at once return in any order, so their copies can reach
+// SMKV in another order than Aerospike applied them; when the last ends, the
+// record is copied whole from Aerospike.
+func (s *Shadow) begin(namespace, set string, userKey any) *pending {
+	if s == nil || s.off.Load() || !s.connected.Load() {
+		return nil
+	}
+	table, key, ok := s.locate(namespace, set, userKey)
+	if !ok {
+		return nil
+	}
+	p := &pending{table: table, key: key, lane: s.lane(table, key), id: table + "\x00" + string(key)}
+	w := &s.writing[p.lane]
+	w.mu.Lock()
+	if w.keys == nil {
+		w.keys = map[string]*calls{}
+	}
+	if c := w.keys[p.id]; c != nil {
+		c.n++
+		c.contended = true
+	} else {
+		w.keys[p.id] = &calls{n: 1}
+	}
+	w.mu.Unlock()
+	return p
+}
+
+// end records that p's call returned, after its copy was queued. True means
+// the record must be copied whole: call repair.
+func (s *Shadow) end(p *pending) bool {
+	if p == nil {
+		return false
+	}
+	w := &s.writing[p.lane]
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	c := w.keys[p.id]
+	c.n--
+	if c.n > 0 {
+		return false
+	}
+	delete(w.keys, p.id)
+	return c.contended
+}
+
+// repair copies p's record whole, as whole reads it from Aerospike.
+func (s *Shadow) repair(p *pending, whole reread) {
+	s.enqueue(job{op: opRepair, table: p.table, key: p.key, reread: whole})
+}
+
 // write copies a write Aerospike accepted. replace is true when the record
 // now holds only these bins.
 func (s *Shadow) write(namespace, set string, userKey any, replace bool, bins []bin) {
@@ -342,40 +426,57 @@ func (s *Shadow) remove(namespace, set string, userKey any) {
 
 // compare queues a comparison of SMKV's row with what Aerospike returned for
 // a read of project (all bins if empty). found is false when Aerospike had no
-// record.
-func (s *Shadow) compare(namespace, set string, userKey any, project []string, bins map[string]interface{}, found bool) {
+// record. again repeats the read, for the second look after a mismatch.
+func (s *Shadow) compare(namespace, set string, userKey any, project []string, bins map[string]interface{}, found bool, again reread) {
 	table, key, ok := s.row(namespace, set, userKey)
 	if !ok {
 		return
 	}
-	j := job{op: opCompare, table: table, key: key, found: found, project: project}
+	j := job{op: opCompare, table: table, key: key, found: found, project: project, reread: again}
 	if found {
-		j.columns = make(smkv.Columns, len(bins))
-		for name, v := range bins {
-			if len(project) > 0 && !slices.Contains(project, name) {
-				// The v4 client gets every bin from Aerospike 8, whichever it names.
-				continue
-			}
-			value, ok := columnValue(v)
-			if !ok || value == nil {
-				s.count("unsupported")
-				return
-			}
-			j.columns[name] = value
+		if j.columns, ok = columns(bins, project); !ok {
+			s.count("unsupported")
+			return
 		}
 	}
 	s.enqueue(j)
 }
 
-// row addresses a key's SMKV row.
+// columns is a record's bins as SMKV columns, only project's if any; ok is
+// false if a bin has no column type.
+func columns(bins map[string]interface{}, project []string) (smkv.Columns, bool) {
+	c := make(smkv.Columns, len(bins))
+	for name, v := range bins {
+		if len(project) > 0 && !slices.Contains(project, name) {
+			// The v4 client gets every bin from Aerospike 8, whichever it names.
+			continue
+		}
+		value, ok := columnValue(v)
+		if !ok || value == nil {
+			return nil, false
+		}
+		c[name] = value
+	}
+	return c, true
+}
+
+// row addresses a key's SMKV row, counting why not when it cannot.
 func (s *Shadow) row(namespace, set string, userKey any) (string, []byte, bool) {
 	if namespace != s.config.Namespace {
 		s.count("other_namespace")
 		return "", nil, false
 	}
-	key, ok := rowKey(userKey)
+	table, key, ok := s.locate(namespace, set, userKey)
 	if !ok {
 		s.count("no_user_key")
+	}
+	return table, key, ok
+}
+
+// locate is row without counting.
+func (s *Shadow) locate(namespace, set string, userKey any) (string, []byte, bool) {
+	key, ok := rowKey(userKey)
+	if namespace != s.config.Namespace || !ok {
 		return "", nil, false
 	}
 	if set == "" {
@@ -497,6 +598,65 @@ func (s *Shadow) run(lane chan job) {
 }
 
 func (s *Shadow) apply(ctx context.Context, j job) error {
+	name := opNames[j.op]
+	switch j.op {
+	case opCompare:
+		return s.check(ctx, j)
+	case opRepair:
+		bins, found, err := j.reread()
+		switch {
+		case err != nil:
+			s.count("repair_error")
+			return nil // Aerospike's failure, not SMKV's
+		case !found:
+			j.op = opDelete
+		default:
+			var ok bool
+			if j.columns, ok = columns(bins, nil); !ok {
+				s.count("unsupported")
+				return nil
+			}
+			j.op = opReplace
+		}
+	}
+	err := s.copy(ctx, j)
+	// A definite refusal (Busy) applied nothing, so the copy goes again while
+	// its budget lasts. The lane waits, which keeps the key's writes in order.
+	for delay := 10 * time.Millisecond; refused(err); delay *= 2 {
+		s.count("refused")
+		if !pause(ctx, delay) {
+			break
+		}
+		err = s.copy(ctx, j)
+	}
+	switch {
+	case err == nil:
+		s.count(name)
+	case errors.Is(err, smkv.ErrInvalidArgument):
+		s.count(name + "_invalid")
+	default:
+		s.count(name + "_error")
+	}
+	return err
+}
+
+func refused(err error) bool {
+	return errors.Is(err, smkv.ErrBusy) && !errors.Is(err, smkv.ErrOutcomeUnknown)
+}
+
+// pause waits for d, or returns false if ctx ends first.
+func pause(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (s *Shadow) copy(ctx context.Context, j job) error {
 	var err error
 	switch j.op {
 	case opReplace:
@@ -515,22 +675,28 @@ func (s *Shadow) apply(ctx context.Context, j job) error {
 		if errors.Is(err, smkv.ErrNotFound) {
 			err = nil
 		}
-	case opCompare:
-		return s.check(ctx, j)
-	}
-	name := opNames[j.op]
-	switch {
-	case err == nil:
-		s.count(name)
-	case errors.Is(err, smkv.ErrInvalidArgument):
-		s.count(name + "_invalid")
-	default:
-		s.count(name + "_error")
 	}
 	return err
 }
 
 func (s *Shadow) check(ctx context.Context, j job) error {
+	if j.recheck && j.reread != nil {
+		// Aerospike may have changed too, by a write whose copy is queued
+		// after this look.
+		bins, found, err := j.reread()
+		if err != nil {
+			s.count("compare_error")
+			return nil // Aerospike's failure, not SMKV's
+		}
+		j.found, j.columns = found, nil
+		if found {
+			var ok bool
+			if j.columns, ok = columns(bins, j.project); !ok {
+				s.count("unsupported")
+				return nil
+			}
+		}
+	}
 	got, err := s.store.Get(ctx, j.table, j.key, j.project...)
 	found := err == nil
 	if errors.Is(err, smkv.ErrNotFound) {

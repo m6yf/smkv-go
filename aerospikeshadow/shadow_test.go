@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -19,11 +20,12 @@ import (
 // fakeStore is SMKV's rows in memory, with Update refusing a missing row as
 // SMKV does.
 type fakeStore struct {
-	mu    sync.Mutex
-	rows  map[string]smkv.Columns
-	calls int
-	fail  error         // returned by every call when set
-	hold  chan struct{} // when set, every call waits for it to close
+	mu     sync.Mutex
+	rows   map[string]smkv.Columns
+	calls  int
+	fail   error         // returned by every call when set
+	refuse int           // the next calls refused with ErrBusy
+	hold   chan struct{} // when set, every call waits for it to close
 }
 
 func newFakeStore() *fakeStore { return &fakeStore{rows: map[string]smkv.Columns{}} }
@@ -34,6 +36,10 @@ func (f *fakeStore) enter() error {
 	}
 	f.mu.Lock()
 	f.calls++
+	if f.refuse > 0 {
+		f.refuse--
+		return smkv.ErrBusy
+	}
 	return f.fail
 }
 
@@ -313,6 +319,30 @@ func TestShadowCountsCopiesSMKVRefuses(t *testing.T) {
 	}
 }
 
+func TestShadowSendsACopySMKVRefusedAgain(t *testing.T) {
+	s, store, c := testShadow(t, Config{Lanes: 1})
+	store.refuse = 2
+	s.write("app", "user", userKey(t, "user", "b1").Value(), false, []bin{{"payload", "x"}})
+	s.write("app", "user", userKey(t, "user", "b1").Value(), false, []bin{{"payload", "y"}})
+	eventually(t, "the copies", func() bool { return c.get("merge") == 2 })
+	if c.get("refused") != 2 || c.get("merge_error") != 0 {
+		t.Fatalf("counters %v", c.n)
+	}
+	if row, _ := store.row("user", "b1"); !reflect.DeepEqual(row, smkv.Columns{"payload": "y"}) {
+		t.Fatalf("row %v", row)
+	}
+}
+
+func TestShadowGivesUpOnARefusedCopyAtItsTimeout(t *testing.T) {
+	s, store, c := testShadow(t, Config{Lanes: 1, Timeout: 100 * time.Millisecond})
+	store.refuse = 1 << 30
+	s.write("app", "user", userKey(t, "user", "b2").Value(), false, []bin{{"payload", "x"}})
+	eventually(t, "the failure", func() bool { return c.get("merge_error") == 1 })
+	if n := c.get("refused"); n < 2 || n > 5 {
+		t.Fatalf("refused %d times in 100 ms", n)
+	}
+}
+
 func TestShadowAddressesRowsAsTheMigrationDoes(t *testing.T) {
 	s, store, c := testShadow(t, Config{})
 	oms, _ := as.NewKey("app", "", "1.2.3.4")
@@ -340,16 +370,16 @@ func TestShadowComparesReads(t *testing.T) {
 	s.write("app", "user", key.Value(), false, []bin{{"payload", "a"}, {"blob", []byte{1}}})
 	eventually(t, "the copy", func() bool { return c.get("merge") == 1 })
 
-	s.compare("app", "user", key.Value(), nil, as.BinMap{"payload": "a", "blob": []byte{1}}, true)
-	s.compare("app", "user", key.Value(), []string{"payload"}, as.BinMap{"payload": "a"}, true)
-	s.compare("app", "user", userKey(t, "user", "none").Value(), nil, nil, false)
+	s.compare("app", "user", key.Value(), nil, as.BinMap{"payload": "a", "blob": []byte{1}}, true, nil)
+	s.compare("app", "user", key.Value(), []string{"payload"}, as.BinMap{"payload": "a"}, true, nil)
+	s.compare("app", "user", userKey(t, "user", "none").Value(), nil, nil, false, nil)
 	// A read naming bins compares only those, though Aerospike returned more.
-	s.compare("app", "user", key.Value(), []string{"blob"}, as.BinMap{"payload": "a", "blob": []byte{1}}, true)
+	s.compare("app", "user", key.Value(), []string{"blob"}, as.BinMap{"payload": "a", "blob": []byte{1}}, true, nil)
 	eventually(t, "the matches", func() bool { return c.get("match") == 4 })
 
-	s.compare("app", "user", key.Value(), nil, as.BinMap{"payload": "b", "blob": []byte{1}}, true)
-	s.compare("app", "user", userKey(t, "user", "absent").Value(), nil, as.BinMap{"payload": "a"}, true)
-	s.compare("app", "user", key.Value(), nil, nil, false)
+	s.compare("app", "user", key.Value(), nil, as.BinMap{"payload": "b", "blob": []byte{1}}, true, nil)
+	s.compare("app", "user", userKey(t, "user", "absent").Value(), nil, as.BinMap{"payload": "a"}, true, nil)
+	s.compare("app", "user", key.Value(), nil, nil, false, nil)
 	eventually(t, "the mismatches", func() bool {
 		return c.get("mismatch_value") == 1 && c.get("mismatch_missing") == 1 && c.get("mismatch_extra") == 1
 	})
@@ -361,10 +391,65 @@ func TestShadowComparesReads(t *testing.T) {
 	}
 }
 
+func TestShadowSecondLookReadsAerospikeAgain(t *testing.T) {
+	s, _, c := testShadow(t, Config{})
+	key := userKey(t, "user", "r1")
+	// SMKV holds a write Aerospike applied after the sampled read.
+	s.write("app", "user", key.Value(), true, []bin{{"payload", "b"}})
+	eventually(t, "the copy", func() bool { return c.get("replace") == 1 })
+	again := func() (map[string]interface{}, bool, error) {
+		return map[string]interface{}{"payload": "b"}, true, nil
+	}
+	s.compare("app", "user", key.Value(), nil, as.BinMap{"payload": "a"}, true, again)
+	eventually(t, "the second look", func() bool { return c.get("converged") == 1 })
+	failed := func() (map[string]interface{}, bool, error) { return nil, false, errors.New("timeout") }
+	s.compare("app", "user", key.Value(), nil, as.BinMap{"payload": "a"}, true, failed)
+	eventually(t, "the failed second look", func() bool { return c.get("compare_error") == 1 })
+	if c.get("mismatch_value") != 0 || s.failures.Load() != 0 {
+		t.Fatalf("counters %v, failures %d", c.n, s.failures.Load())
+	}
+}
+
+func TestShadowCopiesWholeAKeyTwoCallsWroteAtOnce(t *testing.T) {
+	s, store, c := testShadow(t, Config{})
+	key := userKey(t, "user", "w1")
+	first := s.begin("app", "user", key.Value())
+	second := s.begin("app", "user", key.Value())
+	// Aerospike applied "new" last, but its call returned first.
+	s.write("app", "user", key.Value(), false, []bin{{"payload", "new"}})
+	if s.end(second) {
+		t.Fatal("a repair before the last call ended")
+	}
+	s.write("app", "user", key.Value(), false, []bin{{"payload", "old"}, {"ip", "x"}})
+	if !s.end(first) {
+		t.Fatal("no repair after two calls at once")
+	}
+	s.repair(first, func() (map[string]interface{}, bool, error) {
+		return map[string]interface{}{"payload": "new"}, true, nil
+	})
+	eventually(t, "the repair", func() bool { return c.get("repair") == 1 })
+	if row, _ := store.row("user", "w1"); !reflect.DeepEqual(row, smkv.Columns{"payload": "new"}) {
+		t.Fatalf("row %v", row)
+	}
+	// A record Aerospike no longer holds is deleted.
+	first, second = s.begin("app", "user", key.Value()), s.begin("app", "user", key.Value())
+	s.end(first)
+	s.end(second)
+	s.repair(second, func() (map[string]interface{}, bool, error) { return nil, false, nil })
+	eventually(t, "the second repair", func() bool { return c.get("repair") == 2 })
+	if _, ok := store.row("user", "w1"); ok {
+		t.Fatal("the row outlived Aerospike's record")
+	}
+	// One call at a time needs no repair.
+	if alone := s.begin("app", "user", key.Value()); s.end(alone) {
+		t.Fatal("a repair after one call")
+	}
+}
+
 func TestShadowCountsAMismatchItsQueuedCopyFixesAsConverged(t *testing.T) {
 	s, store, c := testShadow(t, Config{Recheck: 200 * time.Millisecond})
 	key := userKey(t, "user", "g1")
-	s.compare("app", "user", key.Value(), nil, as.BinMap{"payload": "a"}, true)
+	s.compare("app", "user", key.Value(), nil, as.BinMap{"payload": "a"}, true, nil)
 	eventually(t, "the first look", func() bool {
 		store.mu.Lock()
 		defer store.mu.Unlock()
