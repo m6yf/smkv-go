@@ -44,7 +44,7 @@ scans included, goes to Aerospike alone.
   concurrently by one process. Concurrent writes from different processes
   are not seen; a later read compare reports them.
 - Again, if SMKV refused a copy before applying it (`Busy`, as during an
-  ownership change): within `Config.Timeout`, holding the key's lane, so
+  ownership change): up to 3 times in 70 ms, holding the key's lane, so
   order is kept (`refused`).
 - Addressed as SMKV's migration tool converts an Aerospike export, so a shadow
   can start from a bulk load: the namespace is the SMKV database in

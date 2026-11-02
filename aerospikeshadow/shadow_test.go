@@ -333,13 +333,25 @@ func TestShadowSendsACopySMKVRefusedAgain(t *testing.T) {
 	}
 }
 
-func TestShadowGivesUpOnARefusedCopyAtItsTimeout(t *testing.T) {
-	s, store, c := testShadow(t, Config{Lanes: 1, Timeout: 100 * time.Millisecond})
+func TestShadowGivesUpOnARefusedCopyAfterAFewTries(t *testing.T) {
+	s, store, c := testShadow(t, Config{Lanes: 1, Timeout: 5 * time.Second})
 	store.refuse = 1 << 30
+	started := time.Now()
 	s.write("app", "user", userKey(t, "user", "b2").Value(), false, []bin{{"payload", "x"}})
 	eventually(t, "the failure", func() bool { return c.get("merge_error") == 1 })
-	if n := c.get("refused"); n < 2 || n > 5 {
-		t.Fatalf("refused %d times in 100 ms", n)
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("the lane was held %v", elapsed)
+	}
+	if n := c.get("refused"); n != refusedRetries+1 && n != refusedRetries {
+		t.Fatalf("refused %d times", n)
+	}
+	// A short timeout still ends the tries sooner.
+	s2, store2, c2 := testShadow(t, Config{Lanes: 1, Timeout: 15 * time.Millisecond})
+	store2.refuse = 1 << 30
+	s2.write("app", "user", userKey(t, "user", "b3").Value(), false, []bin{{"payload", "x"}})
+	eventually(t, "the failure", func() bool { return c2.get("merge_error") == 1 })
+	if n := c2.get("refused"); n > 2 {
+		t.Fatalf("refused %d times in 15 ms", n)
 	}
 }
 

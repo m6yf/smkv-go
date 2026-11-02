@@ -21,7 +21,7 @@
 //
 //   - merge, replace, delete: a copy SMKV applied; with _error, one it failed,
 //     and with _invalid, one past its limits. refused: SMKV refused a copy
-//     before applying it (Busy), and the copy goes again within its Timeout.
+//     before applying it (Busy), and the copy goes again, up to 3 times.
 //   - repair: a record copied whole from Aerospike, after calls that wrote its
 //     key at the same time ended; their copies may have reached SMKV in
 //     another order than Aerospike applied them. repair_error: Aerospike or
@@ -97,6 +97,8 @@ const (
 	failuresBeforePause = 50
 	pauseFor            = 10 * time.Second
 	logMismatchEvery    = 10 * time.Second
+	// A copy SMKV refused goes again at most this many times, 70 ms in all.
+	refusedRetries = 3
 )
 
 type op uint8
@@ -620,9 +622,11 @@ func (s *Shadow) apply(ctx context.Context, j job) error {
 		}
 	}
 	err := s.copy(ctx, j)
-	// A definite refusal (Busy) applied nothing, so the copy goes again while
-	// its budget lasts. The lane waits, which keeps the key's writes in order.
-	for delay := 10 * time.Millisecond; refused(err); delay *= 2 {
+	// A definite refusal (Busy) applied nothing, so the copy goes again, a
+	// few times: the lane waits, which keeps the key's writes in order, but
+	// while SMKV refuses widely, lanes held to their timeout filled every
+	// queue (2026-11-02, a node's map change during re-replication).
+	for retry, delay := 0, 10*time.Millisecond; refused(err) && retry < refusedRetries; retry, delay = retry+1, delay*2 {
 		s.count("refused")
 		if !pause(ctx, delay) {
 			break
