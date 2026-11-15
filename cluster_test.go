@@ -145,7 +145,11 @@ func TestClusterRefreshWaitHonorsDeadline(t *testing.T) {
 func TestClusterRecoversNextCallFromUnknownWriteWithStaleSeed(t *testing.T) {
 	testClusterRecoversNextCall(t, false)
 }
-func TestClusterRecoversNextCallFromFencedBusyWithoutRetry(t *testing.T) {
+
+// A fenced old owner answers Busy, a definite refusal: the same call is sent
+// again, and once Busy has persisted it refreshes the map and reaches the
+// promoted owner.
+func TestClusterRetriesFencedBusyAndReachesThePromotedOwner(t *testing.T) {
 	testClusterRecoversNextCall(t, true)
 }
 func testClusterRecoversNextCall(t *testing.T, busy bool) {
@@ -175,7 +179,7 @@ func testClusterRecoversNextCall(t *testing.T, busy bool) {
 	}
 	go serve(seed, initial)
 	go serve(newer, promoted)
-	oldCalls := make(chan struct{}, 4)
+	oldCalls := make(chan struct{}, 16)
 	go func() {
 		for {
 			conn, e := old.Accept()
@@ -208,11 +212,19 @@ func testClusterRecoversNextCall(t *testing.T, busy bool) {
 		t.Fatal(e)
 	}
 	defer c.Close()
-	expected := ErrOutcomeUnknown
 	if busy {
-		expected = ErrBusy
+		if e = c.Put(context.Background(), []byte("k"), []byte("v")); e != nil {
+			t.Fatalf("a refused write was not sent again: %v", e)
+		}
+		if c.Map().Epoch != 2 {
+			t.Fatal("did not adopt promotion")
+		}
+		if len(oldCalls) != busyRefreshAfter || len(nextCalls) != 1 {
+			t.Fatalf("calls %d/%d", len(oldCalls), len(nextCalls))
+		}
+		return
 	}
-	if e = c.Put(context.Background(), []byte("k"), []byte("v")); !errors.Is(e, expected) {
+	if e = c.Put(context.Background(), []byte("k"), []byte("v")); !errors.Is(e, ErrOutcomeUnknown) {
 		t.Fatalf("want unknown, got %v", e)
 	}
 	select {

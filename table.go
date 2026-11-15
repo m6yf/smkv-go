@@ -16,7 +16,9 @@ const (
 	opDeleteRow byte = 7
 	// opIncrementRow adds to integer or double columns (row-increments.md).
 	opIncrementRow byte = 10
-	maxColumns          = 64
+	// opUpsertRow is an update that creates a missing row (row-upsert.md).
+	opUpsertRow byte = 11
+	maxColumns       = 64
 )
 
 // Columns contains named values: []byte, string, int64 (or int), float64, or bool.
@@ -258,23 +260,48 @@ func (t *Table) Put(ctx context.Context, key []byte, columns Columns, options ..
 // preserves other columns and expiration unless WithTTL is supplied. Set/remove
 // overlap is invalid. No automatic retry occurs after an uncertain outcome.
 func (t *Table) Update(ctx context.Context, key []byte, set Columns, remove []string, options ...WriteOption) error {
+	body, err := t.patch(set, remove)
+	if err != nil {
+		return err
+	}
+	return t.mutate(ctx, opUpdateRow, key, body, options)
+}
+
+// Upsert atomically sets and removes selected columns, creating the row when
+// it is missing: Aerospike's default write. On an existing row it is Update:
+// other columns and the expiration stay unless WithTTL is supplied. A missing
+// row is created from the columns set (removals are ignored; with none set,
+// nothing is created) and never expires without WithTTL. The check and the
+// write are one step on the server, so concurrent first writers of different
+// columns both land. It is safe to repeat. It needs servers with row upserts;
+// an older one answers StatusInvalidRequest (docs/proposals/row-upsert.md).
+func (t *Table) Upsert(ctx context.Context, key []byte, set Columns, remove []string, options ...WriteOption) error {
+	body, err := t.patch(set, remove)
+	if err != nil {
+		return err
+	}
+	return t.mutate(ctx, opUpsertRow, key, body, options)
+}
+
+// patch encodes the columns an update or upsert sets and removes.
+func (t *Table) patch(set Columns, remove []string) ([]byte, error) {
 	for _, n := range remove {
 		if _, ok := set[n]; ok {
-			return invalidRow("column cannot be set and removed together")
+			return nil, invalidRow("column cannot be set and removed together")
 		}
 	}
 	body, err := encodeColumns(set, t.limits.MaxValueBytes)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	deleted, err := encodeNames(remove)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(body)+len(deleted) > t.limits.MaxValueBytes {
-		return invalidRow("update exceeds value limit")
+		return nil, invalidRow("update exceeds value limit")
 	}
-	return t.mutate(ctx, opUpdateRow, key, append(body, deleted...), options)
+	return append(body, deleted...), nil
 }
 
 // Increment atomically adds each amount to its column: int64 (or int)

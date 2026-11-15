@@ -34,7 +34,8 @@ type PartitionOwners struct {
 
 // ClusterClient routes directly to partition owners. Seeds are private admin
 // addresses. Reads retry transient failures within one operation budget.
-// Mutations retry only explicit WrongOwner responses.
+// Mutations retry explicit WrongOwner responses and definite Busy refusals,
+// neither of which applied anything.
 // Mutations with unknown outcomes are returned to the caller without retry.
 type ClusterClient struct {
 	mu            sync.RWMutex
@@ -45,8 +46,12 @@ type ClusterClient struct {
 	clients       map[string]*Client
 	closed        bool
 	refreshNeeded bool
-	life          context.Context
-	cancel        context.CancelFunc
+	// When the last refresh that reached no seed ended, and its error: for
+	// refreshFailedFor, operations that need a refresh do not start another.
+	refreshFailedAt time.Time
+	refreshErr      error
+	life            context.Context
+	cancel          context.CancelFunc
 }
 
 func NewClusterClient(ctx context.Context, seeds []string, options Options) (*ClusterClient, error) {
@@ -87,6 +92,13 @@ func (c *ClusterClient) refreshMap(ctx context.Context, onlyIfNeeded bool) error
 		c.mu.RUnlock()
 		return nil
 	}
+	// No seed answered a moment ago: every operation queued behind that
+	// refresh would otherwise repeat it, one probe timeout each.
+	if onlyIfNeeded && c.refreshErr != nil && time.Since(c.refreshFailedAt) < refreshFailedFor {
+		err := c.refreshErr
+		c.mu.RUnlock()
+		return err
+	}
 	seeds := append([]string(nil), c.seeds...)
 	closed := c.closed
 	current := c.topology
@@ -110,11 +122,24 @@ func (c *ClusterClient) refreshMap(ctx context.Context, onlyIfNeeded bool) error
 	}
 	var best ClusterMap
 	last := error(ErrUnavailable)
+	// Once one seed has answered, the others have refreshGrace to do so.
+	var grace <-chan time.Time
+collect:
 	for range seeds {
-		r := <-results
+		var r observation
+		select {
+		case r = <-results:
+		case <-grace:
+			break collect
+		}
 		if r.err != nil {
 			last = r.err
 			continue
+		}
+		if grace == nil {
+			timer := time.NewTimer(refreshGrace)
+			defer timer.Stop()
+			grace = timer.C
 		}
 		m := r.m
 		if current.Epoch > 0 && (m.Cluster != current.Cluster || len(m.Partitions) != len(current.Partitions)) {
@@ -134,6 +159,9 @@ func (c *ClusterClient) refreshMap(ctx context.Context, onlyIfNeeded bool) error
 		}
 	}
 	if best.Epoch == 0 {
+		c.mu.Lock()
+		c.refreshFailedAt, c.refreshErr = time.Now(), last
+		c.mu.Unlock()
 		return last
 	}
 	c.mu.Lock()
@@ -141,6 +169,7 @@ func (c *ClusterClient) refreshMap(ctx context.Context, onlyIfNeeded bool) error
 	if c.closed {
 		return ErrClosed
 	}
+	c.refreshErr = nil
 	for _, n := range best.Nodes {
 		if c.clients[n.ID] == nil {
 			client, err := NewClient(n.Client, c.options)
@@ -220,6 +249,24 @@ func validateMap(m ClusterMap) error {
 	}
 	return nil
 }
+
+// busyRefreshAfter is how many Busy answers in a row one operation takes
+// before it asks for a map refresh. Busy comes from the right node: a
+// partition changing hands, a map being installed, a full queue. Those pass
+// in tens of milliseconds, and the node answers WrongOwner once the partition
+// has left it. A node that stays Busy may be cut off from a cluster that has
+// moved on, so a refresh follows.
+const busyRefreshAfter = 3
+
+// refreshGrace is how long a refresh waits for the remaining seeds once one
+// has answered. An unreachable seed otherwise costs every refresh its whole
+// probe timeout, and every operation waiting for that refresh with it.
+const refreshGrace = 50 * time.Millisecond
+
+// refreshFailedFor is how long after a refresh that reached no seed the
+// operations that need one go on with the map they have.
+const refreshFailedFor = 200 * time.Millisecond
+
 func transientReadError(err error) bool {
 	var network net.Error
 	return errors.Is(err, ErrBusy) || errors.Is(err, ErrUnavailable) || errors.Is(err, ErrTimedOut) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.DeadlineExceeded) || errors.As(err, &network)
@@ -237,6 +284,10 @@ func (c *ClusterClient) call(ctx context.Context, r request, replica, readOnly b
 		deadline = d
 	}
 	delay := 10 * time.Millisecond
+	// The last refusal, returned if the budget ends while retrying: it says
+	// the mutation was not applied, which a bare deadline error would not.
+	var refused error
+	busy := 0
 	for {
 		if c.life.Err() != nil {
 			return nil, ErrClosed
@@ -245,13 +296,20 @@ func (c *ClusterClient) call(ctx context.Context, r request, replica, readOnly b
 			return nil, err
 		}
 		if !time.Now().Before(deadline) {
+			if refused != nil {
+				return nil, refused
+			}
 			return nil, context.DeadlineExceeded
 		}
 		c.mu.RLock()
 		refreshNeeded := c.refreshNeeded
+		known := c.topology.Epoch > 0
 		c.mu.RUnlock()
 		if refreshNeeded {
-			if err := c.refreshBy(ctx, deadline); err != nil {
+			// A refresh that fails leaves the map the client has: the
+			// request goes to the owner it names. Failing here failed
+			// writes that were never sent, whenever no admin port answered.
+			if err := c.refreshBy(ctx, deadline); err != nil && !known {
 				if c.life.Err() != nil {
 					return nil, ErrClosed
 				}
@@ -260,6 +318,9 @@ func (c *ClusterClient) call(ctx context.Context, r request, replica, readOnly b
 				}
 				c.pause(ctx, deadline, &delay)
 				continue
+			}
+			if c.life.Err() != nil {
+				return nil, ErrClosed
 			}
 		}
 		c.mu.RLock()
@@ -284,16 +345,28 @@ func (c *ClusterClient) call(ctx context.Context, r request, replica, readOnly b
 		if err == nil {
 			return value, nil
 		}
-		retry := errors.Is(err, ErrWrongOwner) || (readOnly && transientReadError(err))
-		if retry || transientReadError(err) || errors.Is(err, ErrOutcomeUnknown) {
+		unknown := errors.Is(err, ErrOutcomeUnknown)
+		// Busy without an unknown outcome is a definite refusal: nothing
+		// was applied, so a mutation may be sent again, as after WrongOwner.
+		definiteBusy := errors.Is(err, ErrBusy) && !unknown
+		retry := errors.Is(err, ErrWrongOwner) || definiteBusy || (readOnly && transientReadError(err))
+		if definiteBusy {
+			busy++
+		} else {
+			busy = 0
+		}
+		if (!definiteBusy || busy >= busyRefreshAfter) && (retry || transientReadError(err) || unknown) {
 			c.mu.Lock()
 			c.refreshNeeded = true
 			c.mu.Unlock()
 		}
 		// An uncertain mutation must never cross the retry boundary, even when wrapped
 		// around another status. Preserve its original error for caller reconciliation.
-		if errors.Is(err, ErrOutcomeUnknown) || !retry {
+		if unknown || !retry {
 			return value, err
+		}
+		if errors.Is(err, ErrWrongOwner) || definiteBusy {
+			refused = err
 		}
 		c.pause(ctx, deadline, &delay)
 	}

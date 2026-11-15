@@ -131,7 +131,9 @@ slices until the call returns.
 `Get` with no projection returns all columns. Missing projected columns are
 omitted; a missing row returns `ErrNotFound`. `Put` replaces the entire row and
 omitted TTL means no expiration. `Update` requires an existing, unexpired row;
-omitted TTL preserves its absolute expiration. `WithTTL` resets the row TTL,
+omitted TTL preserves its absolute expiration. `Upsert` takes the same arguments
+and creates the row from the columns it sets when the row is missing, in one
+atomic request; it needs SMKV 0.2.0 on every node. `WithTTL` resets the row TTL,
 and zero expires it immediately. Clearing expiration requires replacing the row
 with `Put` without TTL. `Delete` is idempotent and accepts only `WithSync`.
 `GetReplica` on cluster table handles explicitly allows stale replica reads.
@@ -163,7 +165,8 @@ have completed. This includes transport/protocol failures after writing began an
 conservatively includes server storage errors, unavailability, and execution
 timeouts. Do not blindly retry these failures. A Busy response means the server
 did not accept the request. Failed validation, dialing, and pool waits do not mark
-the outcome unknown. None of these errors trigger automatic retries.
+the outcome unknown. A direct `Client` retries none of these; `ClusterClient`
+retries `WrongOwner` and `Busy`, which applied nothing.
 
 ## Sharded clusters
 
@@ -180,8 +183,12 @@ value, err := cluster.Get(ctx, []byte("key"))
 The client hashes opaque keys with IEEE CRC32, routes to each partition's primary,
 and refreshes the versioned map on explicit `ErrWrongOwner` rejection. `GetReplica`
 opts into stale reads. An uncertain mutation is never automatically retried.
-Mutation `Busy` responses also return to the caller. Cluster reads retry transient
-transport, Busy, Unavailable and execution-timeout failures with a map refresh.
+A mutation answered `Busy` was not applied, so `ClusterClient` sends it again
+within the operation's budget, pausing 10–100 ms between attempts; if the budget
+ends first, the call returns `ErrBusy`. That covers a partition changing hands,
+a map being installed and a full queue, which pass in tens of milliseconds.
+Cluster reads retry transient transport, Busy, Unavailable and
+execution-timeout failures with a map refresh.
 Read attempts are capped at 500 ms (or half Options.Timeout), with 10–100 ms
 exponential backoff. NotFound, protocol/storage errors and capacity failures are
 terminal. Primary reads never silently fall back to a replica. Refresh,
@@ -195,10 +202,14 @@ Capacity admission rejections are exposed as `ErrCapacity` (TCP status 8). Use
 an uncertain storage or transport outcome. Inspect resource headroom before retrying;
 the SDK does not automatically retry these writes. Upgrade clients before servers.
 
-After a Busy/unavailable response or transport failure, `ClusterClient` marks its map
-for refresh before the next operation. It queries discovered admin endpoints in
-parallel with bounded probe deadlines and adopts the highest valid epoch. A stale
-or stalled initial seed cannot prevent discovery of a reachable promoted owner.
+After an unavailable response or transport failure, or a third `Busy` in a row
+within one operation, `ClusterClient` marks its map for refresh before the next
+attempt. It queries discovered admin endpoints in parallel with bounded probe
+deadlines and adopts the highest valid epoch; once one endpoint has answered, the
+others have 50 ms, so an unreachable node does not hold every refresh for its
+whole probe timeout. A stale or stalled initial seed cannot prevent discovery of
+a reachable promoted owner. When no endpoint answers, operations go on with the
+map the client has, and try a refresh again 200 ms later.
 The failed mutation is returned with its existing outcome classification; unknown
 mutations are never automatically retried. `Refresh(ctx)` remains available for
 explicit operator/application control.

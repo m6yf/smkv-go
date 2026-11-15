@@ -53,13 +53,24 @@ func TestTableValidationAndOperationSemantics(t *testing.T) {
 		if !bytes.Equal(key, []byte{5, 0, 'u', 's', 'e', 'r', 's', 'k'}) {
 			t.Fatalf("key %x", key)
 		}
-		if op != opUpdateRow || w.ttlSet || replica {
-			t.Fatalf("invalid update options %+v", w)
+		// The first call is the update, the second the upsert: the same
+		// frame under another operation.
+		if op != []byte{opUpdateRow, opUpsertRow}[calls-1] || w.ttlSet || replica {
+			t.Fatalf("op %d, options %+v", op, w)
+		}
+		if set, err := decodeColumns(value[:len(value)-2]); err != nil || set["x"] != int64(1) {
+			t.Fatalf("columns %v %v", set, err)
 		}
 		return nil, nil
 	}}
 	if err := table.Update(context.Background(), []byte("k"), Columns{"x": int64(1)}, nil); err != nil {
 		t.Fatal(err)
+	}
+	if err := table.Upsert(context.Background(), []byte("k"), Columns{"x": int64(1)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := table.Upsert(context.Background(), []byte("k"), Columns{"x": true}, []string{"x"}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatal("upsert conflict accepted")
 	}
 	if err := table.Update(context.Background(), []byte("k"), Columns{"x": true}, []string{"x"}); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatal("conflict accepted")
@@ -73,7 +84,7 @@ func TestTableValidationAndOperationSemantics(t *testing.T) {
 	if _, err := table.Get(context.Background(), []byte("k"), "x", "x"); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatal("duplicate projection accepted")
 	}
-	if calls != 1 {
+	if calls != 2 {
 		t.Fatalf("validation performed network calls: %d", calls)
 	}
 }

@@ -58,39 +58,44 @@ func retryFixture(t *testing.T, status int, promote bool) (*ClusterClient, *atom
 			}
 			go func() {
 				defer c.Close()
-				h := make([]byte, 24)
-				if _, e := io.ReadFull(c, h); e != nil {
-					return
-				}
-				_, e := io.CopyN(io.Discard, c, int64(binary.LittleEndian.Uint32(h[8:12]))+int64(binary.LittleEndian.Uint32(h[12:16])))
-				if e != nil {
-					return
-				}
-				calls.Add(1)
-				s := int(StatusOK)
-				if oldNode {
-					s = status
-					if promote {
-						moved.Store(true)
+				// A connection serves requests until it fails, as a server's does.
+				for {
+					h := make([]byte, 24)
+					if _, e := io.ReadFull(c, h); e != nil {
+						return
+					}
+					_, e := io.CopyN(io.Discard, c, int64(binary.LittleEndian.Uint32(h[8:12]))+int64(binary.LittleEndian.Uint32(h[12:16])))
+					if e != nil {
+						return
+					}
+					calls.Add(1)
+					s := int(StatusOK)
+					if oldNode {
+						s = status
+						if promote {
+							moved.Store(true)
+						}
+					}
+					if s == -1 {
+						return
+					}
+					if s == -2 {
+						_, _ = io.Copy(io.Discard, c)
+						return
+					}
+					body := []byte{}
+					if s == 0 && (h[4] == opGet || h[4] == opGetRow) {
+						body = []byte("value")
+						if h[4] == opGetRow {
+							body, _ = encodeColumns(Columns{"v": "value"}, 1024)
+						}
+					}
+					reply := []byte{'S', 'K', 'R', '1', byte(s), 0, 0, 0, 0, 0, 0, 0}
+					binary.LittleEndian.PutUint32(reply[8:], uint32(len(body)))
+					if _, e := c.Write(append(reply, body...)); e != nil {
+						return
 					}
 				}
-				if s == -1 {
-					return
-				}
-				if s == -2 {
-					_, _ = io.Copy(io.Discard, c)
-					return
-				}
-				body := []byte{}
-				if s == 0 {
-					body = []byte("value")
-					if h[4] == opGetRow {
-						body, _ = encodeColumns(Columns{"v": "value"}, 1024)
-					}
-				}
-				reply := []byte{'S', 'K', 'R', '1', byte(s), 0, 0, 0, 0, 0, 0, 0}
-				binary.LittleEndian.PutUint32(reply[8:], uint32(len(body)))
-				c.Write(append(reply, body...))
 			}()
 		}
 	}
@@ -108,7 +113,13 @@ func TestClusterReadRetriesTransientFailureOnPromotedOwner(t *testing.T) {
 		t.Run(fmt.Sprintf("status-%d", s), func(t *testing.T) {
 			c, old, next := retryFixture(t, s, true)
 			v, e := c.Get(context.Background(), []byte("k"))
-			if e != nil || string(v) != "value" || old.Load() != 1 || next.Load() != 1 || c.Map().Epoch != 2 {
+			// Busy comes from a node that may still own the key: it is asked
+			// again before the map is refreshed.
+			asked := int32(1)
+			if s == int(StatusBusy) {
+				asked = busyRefreshAfter
+			}
+			if e != nil || string(v) != "value" || old.Load() != asked || next.Load() != 1 || c.Map().Epoch != 2 {
 				t.Fatalf("value=%q err=%v calls=%d/%d epoch=%d", v, e, old.Load(), next.Load(), c.Map().Epoch)
 			}
 		})
@@ -157,16 +168,93 @@ func TestClusterCloseCancelsReadRetry(t *testing.T) {
 	}
 }
 
-func TestClusterRowReadRecoversButRowMutationDoesNotRetryBusy(t *testing.T) {
+func TestClusterRowReadRecoversAndRowMutationRetriesBusy(t *testing.T) {
 	c, old, next := retryFixture(t, -1, true)
 	row, e := c.Table("test").Get(context.Background(), []byte("k"))
 	if e != nil || row["v"] != "value" || old.Load() != 1 || next.Load() != 1 {
 		t.Fatalf("row=%v err=%v calls=%d/%d", row, e, old.Load(), next.Load())
 	}
+	// Busy is a definite refusal: the update is sent again, and once Busy
+	// has persisted the map is refreshed and the promoted owner takes it.
 	c, old, next = retryFixture(t, int(StatusBusy), true)
 	e = c.Table("test").Update(context.Background(), []byte("k"), Columns{"v": "new"}, nil)
-	if !errors.Is(e, ErrBusy) || old.Load() != 1 || next.Load() != 0 {
+	if e != nil || old.Load() != busyRefreshAfter || next.Load() != 1 {
 		t.Fatalf("err=%v calls=%d/%d", e, old.Load(), next.Load())
+	}
+}
+
+// A node that stays Busy and still owns the key: the write is refused until
+// the budget ends, and the error says so (not applied), not a bare deadline.
+func TestClusterMutationRefusedUntilTheBudgetEndsReportsBusy(t *testing.T) {
+	c, old, next := retryFixture(t, int(StatusBusy), false)
+	started := time.Now()
+	e := c.Put(context.Background(), []byte("k"), []byte("v"))
+	if !errors.Is(e, ErrBusy) || errors.Is(e, ErrOutcomeUnknown) {
+		t.Fatalf("got %v", e)
+	}
+	if elapsed := time.Since(started); elapsed < 900*time.Millisecond || elapsed > 2*time.Second {
+		t.Fatalf("gave up after %v of a 1 s budget", elapsed)
+	}
+	if old.Load() < 5 || next.Load() != 0 {
+		t.Fatalf("calls %d/%d", old.Load(), next.Load())
+	}
+}
+
+// One seed that answers nothing must not cost every refresh its probe
+// timeout: once another seed has answered, the rest get a short grace.
+func TestClusterRefreshDoesNotWaitOutASilentSeed(t *testing.T) {
+	c, _, _ := retryFixture(t, 0, false)
+	silent, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer silent.Close()
+	go func() {
+		for {
+			conn, e := silent.Accept()
+			if e != nil {
+				return
+			}
+			defer conn.Close() // accepted, never answered
+		}
+	}()
+	c.mu.Lock()
+	c.seeds = append(c.seeds, silent.Addr().String())
+	c.mu.Unlock()
+	started := time.Now()
+	if e = c.Refresh(context.Background()); e != nil {
+		t.Fatal(e)
+	}
+	if elapsed := time.Since(started); elapsed > 4*refreshGrace {
+		t.Fatalf("refresh took %v with one silent seed", elapsed)
+	}
+}
+
+// When no seed answers, a write still goes to the owner the client's map
+// names, and the operations behind a failed refresh do not each repeat it.
+func TestClusterWritesOnItsMapWhenNoSeedAnswers(t *testing.T) {
+	c, old, _ := retryFixture(t, 0, false)
+	dead, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	address := dead.Addr().String()
+	dead.Close()
+	c.mu.Lock()
+	c.seeds = []string{address}
+	c.refreshNeeded = true
+	c.mu.Unlock()
+	started := time.Now()
+	for i := 0; i < 20; i++ {
+		if e = c.Put(context.Background(), []byte("k"), []byte("v")); e != nil {
+			t.Fatalf("write %d failed without being sent: %v", i, e)
+		}
+	}
+	if old.Load() != 20 {
+		t.Fatalf("calls %d", old.Load())
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("20 writes took %v behind failed refreshes", elapsed)
 	}
 }
 func TestClusterReplicaReadKeepsReplicaRouting(t *testing.T) {
