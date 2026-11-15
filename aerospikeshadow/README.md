@@ -35,7 +35,9 @@ scans included, goes to Aerospike alone.
   Aerospike's error unchanged and is not copied.
 - With Aerospike's meaning: `UPDATE` (the default) sets the bins written and
   creates a missing row; `REPLACE`, `REPLACE_ONLY` and `CREATE_ONLY` replace the
-  row; a nil bin removes its column.
+  row; a nil bin removes its column. An `UPDATE` is one SMKV upsert, so two
+  first writers of different bins both land. This needs SMKV 0.2.0 on every
+  node; use `aerospikeshadow/v0.1.3` against older servers.
 - In the order the calls returned, per key: a key's copies always take the
   same lane. Calls that write one key at the same time can return in another
   order than Aerospike applied them. When the last of them returns, the

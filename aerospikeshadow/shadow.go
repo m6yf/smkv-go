@@ -137,6 +137,7 @@ type bin struct {
 type store interface {
 	Put(ctx context.Context, table string, key []byte, columns smkv.Columns) error
 	Update(ctx context.Context, table string, key []byte, set smkv.Columns, remove []string) error
+	Upsert(ctx context.Context, table string, key []byte, set smkv.Columns, remove []string) error
 	Delete(ctx context.Context, table string, key []byte) error
 	Get(ctx context.Context, table string, key []byte, projection ...string) (smkv.Columns, error)
 }
@@ -149,6 +150,10 @@ func (s clusterStore) Put(ctx context.Context, table string, key []byte, columns
 
 func (s clusterStore) Update(ctx context.Context, table string, key []byte, set smkv.Columns, remove []string) error {
 	return s.client.Table(table).Update(ctx, key, set, remove)
+}
+
+func (s clusterStore) Upsert(ctx context.Context, table string, key []byte, set smkv.Columns, remove []string) error {
+	return s.client.Table(table).Upsert(ctx, key, set, remove)
 }
 
 func (s clusterStore) Delete(ctx context.Context, table string, key []byte) error {
@@ -666,14 +671,17 @@ func (s *Shadow) copy(ctx context.Context, j job) error {
 	case opReplace:
 		err = s.store.Put(ctx, j.table, j.key, j.columns)
 	case opMerge:
-		err = s.store.Update(ctx, j.table, j.key, j.columns, j.remove)
-		if errors.Is(err, smkv.ErrNotFound) {
-			// Aerospike creates a missing record; SMKV's Update needs the row.
-			err = nil
-			if len(j.columns) > 0 {
-				err = s.store.Put(ctx, j.table, j.key, j.columns)
+		if len(j.columns) == 0 {
+			// Only removals: Aerospike creates no record for them.
+			err = s.store.Update(ctx, j.table, j.key, nil, j.remove)
+			if errors.Is(err, smkv.ErrNotFound) {
+				err = nil
 			}
+			break
 		}
+		// Aerospike creates a missing record; so does an upsert, in the same
+		// request, so two first writers of different bins keep both.
+		err = s.store.Upsert(ctx, j.table, j.key, j.columns, j.remove)
 	case opDelete:
 		err = s.store.Delete(ctx, j.table, j.key)
 		if errors.Is(err, smkv.ErrNotFound) {

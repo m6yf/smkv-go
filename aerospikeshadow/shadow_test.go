@@ -18,7 +18,7 @@ import (
 )
 
 // fakeStore is SMKV's rows in memory, with Update refusing a missing row as
-// SMKV does.
+// SMKV does and Upsert creating it.
 type fakeStore struct {
 	mu     sync.Mutex
 	rows   map[string]smkv.Columns
@@ -65,6 +65,26 @@ func (f *fakeStore) Update(_ context.Context, table string, key []byte, set smkv
 	row, ok := f.rows[table+"/"+string(key)]
 	if !ok {
 		return smkv.ErrNotFound
+	}
+	for k, v := range set {
+		row[k] = v
+	}
+	for _, k := range remove {
+		delete(row, k)
+	}
+	return nil
+}
+
+func (f *fakeStore) Upsert(_ context.Context, table string, key []byte, set smkv.Columns, remove []string) error {
+	err := f.enter()
+	defer f.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	row, ok := f.rows[table+"/"+string(key)]
+	if !ok {
+		row = smkv.Columns{}
+		f.rows[table+"/"+string(key)] = row
 	}
 	for k, v := range set {
 		row[k] = v
@@ -395,10 +415,10 @@ func TestShadowComparesReads(t *testing.T) {
 	eventually(t, "the mismatches", func() bool {
 		return c.get("mismatch_value") == 1 && c.get("mismatch_missing") == 1 && c.get("mismatch_extra") == 1
 	})
-	// The copy's Update found no row and Put it; each mismatch was read twice.
+	// The copy was one upsert; each mismatch was read twice.
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.calls != 2+4+3*2 {
+	if store.calls != 1+4+3*2 {
 		t.Fatalf("%d calls", store.calls)
 	}
 }
